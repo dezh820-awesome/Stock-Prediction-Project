@@ -1,0 +1,2190 @@
+SentimentEngagementAnalyzer
+===========================
+A modular Python framework for predicting Tesla daily stock returns by
+combining FinBERT-derived social media sentiment features with OHLCV-based
+technical indicators.
+
+Architecture
+------------
+  TweetPreprocessor            — raw tweet cleaning and optional FinBERT inference
+  SentimentFeatureEngineer     — daily sentiment feature construction
+  TechnicalFeatureEngineer     — OHLCV technical indicator construction
+  StatisticalValidator         — LINE-style diagnostics, nested tests, bootstrap CI
+  SentimentEngagementAnalyzer  — unified fit/predict/summary/plot API
+  RealTimeInferenceEngine      — optional yfinance-based inference utilities
+
+Statistical Tests Implemented
+-----------------------------
+  - Nested F-test (baseline vs sentiment-enhanced)
+  - Bootstrap ΔR² confidence intervals (default 1,000 iterations)
+  - Durbin-Watson autocorrelation test
+  - Ljung-Box Q-test for residual independence
+  - Shapiro-Wilk normality test
+  - Jarque-Bera normality test
+  - Breusch-Pagan homoscedasticity test
+  - Variance Inflation Factor (VIF) multicollinearity analysis
+  - OLS coefficient t-tests with confidence intervals (for inference summaries)
+  - AIC, BIC, adjusted R²
+  - No-information benchmarks (random walk, mean predictor)
+
+Prediction Intervals
+--------------------
+  - Conformal (default after training): uses the (1-α) quantile of |train residuals|
+    to produce finite-sample, distribution-free intervals: ŷ ± q̂
+  - Fallback: t-based interval using training residual std (if conformal not available)
+
+Visualizations Produced
+-----------------------
+  - Baseline vs full model comparison bar charts (R², RMSE, MAE)
+  - Time-series of actual vs predicted returns with prediction intervals
+  - Actual vs predicted scatter plot
+  - Residuals vs predicted plot
+  - Normal Q-Q plot
+  - Residual distribution histogram
+  - Feature importance bar chart with confidence intervals (colour-coded by p-value)
+  - Feature correlation heatmap
+
+Usage
+-----
+  from sentiment_engagement_analyzer import (
+      SentimentEngagementAnalyzer, ModelConfig, ModelType,
+      TweetPreprocessor, RealTimeInferenceEngine
+  )
+
+  config   = ModelConfig(model_type=ModelType.RIDGE, verbose=True)
+  analyzer = SentimentEngagementAnalyzer(config)
+  analyzer.fit(stock_df, tweet_df)
+  analyzer.summary()
+  analyzer.plot("all")
+
+Dependencies
+------------
+  pip install pandas numpy scikit-learn statsmodels scipy matplotlib seaborn
+  pip install transformers torch          # FinBERT inference
+  pip install yfinance                    # realtime inference utilities
+  pip install kagglehub                   # Kaggle dataset loading
+  pip install databento                   # OHLCV data from DataBento
+"""
+
+from __future__ import annotations
+
+import re
+import logging
+import warnings
+import unicodedata
+from collections import Counter
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Dict, List, Optional, Tuple, Union
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy import stats
+from scipy.stats import jarque_bera
+
+from sklearn.linear_model import LinearRegression, Ridge, Lasso
+from sklearn.model_selection import cross_val_score, TimeSeriesSplit
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
+
+import statsmodels.api as sm
+from statsmodels.stats.diagnostic import het_breuschpagan, acorr_ljungbox
+from statsmodels.stats.stattools import durbin_watson
+from statsmodels.stats.outliers_influence import variance_inflation_factor
+
+# Avoid blanket suppression. You can uncomment specific filters if needed.
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)s  %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger(__name__)
+
+
+# ============================================================================
+# Enums
+# ============================================================================
+
+class ModelType(Enum):
+    LINEAR = "linear"
+    RIDGE  = "ridge"
+    LASSO  = "lasso"
+
+
+class FeatureSet(Enum):
+    BASELINE       = "baseline"
+    SENTIMENT_ONLY = "sentiment_only"
+    FULL           = "full"
+
+
+class FeatureSelectionStrategy(Enum):
+    ALL_FEATURES     = "all_features"
+    LOW_COLLINEARITY = "low_collinearity"
+    TOP_K            = "top_k"
+
+
+# ============================================================================
+# Configuration Dataclasses
+# ============================================================================
+
+@dataclass
+class ModelConfig:
+    """
+    Full configuration for a SentimentEngagementAnalyzer run.
+
+    Parameters
+    ----------
+    model_type           : LINEAR, RIDGE, or LASSO regression
+    feature_set          : Which feature groups to include in the full model
+    feature_selection    : How to select features (all / low-VIF / top-K)
+    top_k_features       : Number of features when using TOP_K strategy
+    vif_threshold        : Maximum acceptable VIF before removing a feature
+    test_size            : Fraction of data reserved for the test set (temporal)
+    cv_folds             : Number of folds for TimeSeriesSplit cross-validation
+    confidence_level     : Confidence level for CIs (0.95 = 95%)
+    alpha                : Regularisation strength for Ridge / Lasso
+    bootstrap_n          : Bootstrap iterations for ΔR² confidence interval
+    min_confidence       : FinBERT confidence threshold below which tweets are dropped
+    rolling_windows      : List of rolling window sizes for sentiment features
+    random_state         : Random seed for reproducibility
+    verbose              : Print progress messages and summary tables
+    """
+    model_type:           ModelType                  = ModelType.LINEAR
+    feature_set:          FeatureSet                 = FeatureSet.FULL
+    feature_selection:    FeatureSelectionStrategy   = FeatureSelectionStrategy.LOW_COLLINEARITY
+    top_k_features:       int                        = 15
+    vif_threshold:        float                      = 10.0
+    test_size:            float                      = 0.20
+    cv_folds:             int                        = 5
+    confidence_level:     float                      = 0.95
+    alpha:                float                      = 1.0
+    bootstrap_n:          int                        = 1_000
+    min_confidence:       float                      = 0.60
+    rolling_windows:      List[int]                  = field(default_factory=lambda: [3, 7, 14])
+    random_state:         int                        = 42
+    verbose:              bool                       = True
+
+
+@dataclass
+class AssumptionTestResults:
+    """Stores diagnostics related to LINE-style checks with numeric statistics."""
+    # Linearity (proxy)
+    residual_mean:             float      = 0.0
+    residual_pred_corr:        float      = 0.0
+    linearity_pass:            bool       = False
+    # Independence
+    durbin_watson_stat:        float      = 0.0
+    ljung_box_stat:            float      = 0.0
+    ljung_box_p:               float      = 1.0
+    independence_pass:         bool       = False
+    # Normality
+    shapiro_wilk_stat:         float      = 0.0
+    shapiro_wilk_p:            float      = 1.0
+    jarque_bera_stat:          float      = 0.0
+    jarque_bera_p:             float      = 1.0
+    normality_pass:            bool       = False
+    # Homoscedasticity
+    breusch_pagan_stat:        float      = 0.0
+    breusch_pagan_p:           float      = 1.0
+    homoscedasticity_pass:     bool       = False
+    # Multicollinearity
+    vif_values:                Dict[str, float] = field(default_factory=dict)
+    max_vif:                   float      = 0.0
+    mean_vif:                  float      = 0.0
+    high_vif_features:         List[str]  = field(default_factory=list)
+    multicollinearity_pass:    bool       = False
+    # Residual stats
+    residual_std:              float      = 0.0
+    residual_skew:             float      = 0.0
+    residual_kurtosis:         float      = 0.0
+    # Overall
+    all_pass:                  bool       = False
+
+
+@dataclass
+class InferenceResults:
+    """Stores coefficient-level OLS inference results."""
+    coefficients:     pd.DataFrame = field(default_factory=pd.DataFrame)
+    f_stat:           float        = 0.0
+    f_pvalue:         float        = 0.0
+    adj_r2:           float        = 0.0
+    aic:              float        = 0.0
+    bic:              float        = 0.0
+    condition_number: float        = 0.0
+    n_obs:            int          = 0
+    df_resid:         int          = 0
+
+
+@dataclass
+class ModelResults:
+    """Complete results container for a single trained model variant."""
+    feature_set:        str
+    features_used:      List[str]             = field(default_factory=list)
+    # Performance metrics
+    train_r2:           float                 = 0.0
+    test_r2:            float                 = 0.0
+    train_rmse:         float                 = 0.0
+    test_rmse:          float                 = 0.0
+    train_mae:          float                 = 0.0
+    test_mae:           float                 = 0.0
+    train_mse:          float                 = 0.0
+    test_mse:           float                 = 0.0
+    # Cross-validation
+    cv_r2_scores:       np.ndarray            = field(default_factory=lambda: np.array([]))
+    cv_r2_mean:         float                 = 0.0
+    cv_r2_std:          float                 = 0.0
+    # Predictions and residuals
+    y_train:            np.ndarray            = field(default_factory=lambda: np.array([]))
+    y_pred_train:       np.ndarray            = field(default_factory=lambda: np.array([]))
+    y_test:             np.ndarray            = field(default_factory=lambda: np.array([]))
+    y_pred_test:        np.ndarray            = field(default_factory=lambda: np.array([]))
+    residuals_train:    np.ndarray            = field(default_factory=lambda: np.array([]))
+    residuals_test:     np.ndarray            = field(default_factory=lambda: np.array([]))
+    test_index:         object                = None
+    # Prediction interval calibration (conformal radius)
+    conformal_q:        float                 = 0.0
+    # Statistical inference
+    inference:          InferenceResults      = field(default_factory=InferenceResults)
+    assumptions:        AssumptionTestResults = field(default_factory=AssumptionTestResults)
+    # Nested comparison fields (populated for full model only)
+    nested_f_stat:      float                 = 0.0
+    nested_f_pvalue:    float                 = 0.0
+    bootstrap_delta_r2: float                 = 0.0
+    bootstrap_ci_lo:    float                 = 0.0
+    bootstrap_ci_hi:    float                 = 0.0
+    bootstrap_ci_all:   np.ndarray            = field(default_factory=lambda: np.array([]))
+    # Fitted objects
+    scaler:             Optional[StandardScaler] = None
+    model:              object                = None
+
+
+# ============================================================================
+# Tweet Preprocessor + FinBERT Inference
+# ============================================================================
+
+class TweetPreprocessor:
+    """
+    Cleans raw tweet text and optionally runs FinBERT sentiment inference.
+
+    Pipeline
+    --------
+    1. Remove exact duplicates on tweet text
+    2. Filter non-English tweets (ASCII-ratio heuristic)
+    3. Remove bot-like / repetitive content (length + word-frequency heuristic)
+    4. Strip URLs, @mentions, hashtag symbols, emojis, excess whitespace
+    5. Run FinBERT (yiyanghkust/finbert-tone) in configurable batch sizes
+    6. Normalise label names (Positive / Negative / Neutral)
+    7. Drop predictions below min_confidence threshold
+
+    Notes
+    -----
+    The language and bot filters are heuristics and may remove some valid content.
+    """
+
+    URL_RE        = re.compile(r"https?://\S+|www\.\S+")
+    MENTION_RE    = re.compile(r"@\w+")
+    HASHTAG_RE    = re.compile(r"#(\w+)")
+    WHITESPACE_RE = re.compile(r"\s+")
+
+    LABEL_MAP = {
+        "Positive": "Positive", "POSITIVE": "Positive", "positive": "Positive",
+        "Negative": "Negative", "NEGATIVE": "Negative", "negative": "Negative",
+        "Neutral":  "Neutral",  "NEUTRAL":  "Neutral",  "neutral":  "Neutral",
+    }
+
+    def __init__(self, min_confidence: float = 0.60, batch_size: int = 64):
+        self.min_confidence = min_confidence
+        self.batch_size     = batch_size
+        self._pipeline      = None
+
+    def _load_pipeline(self):
+        """Lazy-load FinBERT to avoid import overhead when not needed."""
+        if self._pipeline is None:
+            try:
+                from transformers import pipeline as hf_pipeline
+                logger.info("Loading FinBERT (yiyanghkust/finbert-tone)...")
+                self._pipeline = hf_pipeline(
+                    "sentiment-analysis",
+                    model="yiyanghkust/finbert-tone",
+                    truncation=True,
+                    max_length=128,
+                )
+                logger.info("FinBERT loaded.")
+            except ImportError as e:
+                raise ImportError(
+                    "transformers + torch required: pip install transformers torch"
+                ) from e
+        return self._pipeline
+
+    @staticmethod
+    def clean_text(text: str) -> str:
+        """Remove noise: URLs, @mentions, hashtag symbols, emojis, whitespace."""
+        if not isinstance(text, str):
+            return ""
+        text = TweetPreprocessor.URL_RE.sub("", text)
+        text = TweetPreprocessor.MENTION_RE.sub("", text)
+        text = TweetPreprocessor.HASHTAG_RE.sub(r"\1", text)
+        # Strip emoji / symbols and non-BMP characters
+        text = "".join(
+            c for c in text
+            if unicodedata.category(c) not in ("So", "Cs") and ord(c) < 65536
+        )
+        return TweetPreprocessor.WHITESPACE_RE.sub(" ", text).strip()
+
+    @staticmethod
+    def is_english(text: str, threshold: float = 0.80) -> bool:
+        """Heuristic: fraction of ASCII characters above threshold => likely English."""
+        if not text:
+            return False
+        return sum(1 for c in text if ord(c) < 128) / len(text) >= threshold
+
+    @staticmethod
+    def is_bot_like(text: str) -> bool:
+        """
+        Flag content that is likely bot-generated or uninformative:
+          - Very short (< 5 chars)
+          - Single-word or highly repetitive
+        """
+        if len(text) < 5:
+            return True
+        words = text.split()
+        if not words:
+            return True
+        top_freq = Counter(words).most_common(1)[0][1] / len(words)
+        return top_freq > 0.60 and len(words) > 3
+
+    def preprocess(self, df: pd.DataFrame, text_col: str = "fullText") -> pd.DataFrame:
+        """Run preprocessing (no FinBERT inference). Adds 'cleaned_text' column."""
+        if text_col not in df.columns:
+            raise ValueError(f"Column '{text_col}' not found in DataFrame.")
+
+        logger.info(f"Preprocessing {len(df):,} tweets...")
+        df = df.drop_duplicates(subset=[text_col]).copy()
+        df["cleaned_text"] = df[text_col].apply(self.clean_text)
+        df = df[df["cleaned_text"].apply(self.is_english)].copy()
+        df = df[~df["cleaned_text"].apply(self.is_bot_like)].copy()
+        df = df[df["cleaned_text"].str.len() > 0].copy()
+        df = df.reset_index(drop=True)
+        logger.info(f"Preprocessing complete: {len(df):,} tweets retained.")
+        return df
+
+    def run_finbert(self, df: pd.DataFrame, text_col: str = "cleaned_text") -> pd.DataFrame:
+        """
+        Run batched FinBERT inference. Adds 'sentiment' and 'confidence' columns.
+        Drops rows below min_confidence.
+        """
+        pipe  = self._load_pipeline()
+        texts = df[text_col].tolist()
+        sentiments, confidences = [], []
+
+        logger.info(f"Running FinBERT on {len(texts):,} tweets...")
+        for i in range(0, len(texts), self.batch_size):
+            batch   = texts[i : i + self.batch_size]
+            results = pipe(batch)
+            for r in results:
+                sentiments.append(r["label"])
+                confidences.append(r["score"])
+            if i % (self.batch_size * 50) == 0 and i > 0:
+                logger.info(f"  {min(i + self.batch_size, len(texts)):,} / {len(texts):,} done")
+
+        out = df.copy()
+        out["sentiment"]  = [self.LABEL_MAP.get(s, "Neutral") for s in sentiments]
+        out["confidence"] = confidences
+
+        n_before = len(out)
+        out = out[out["confidence"] >= self.min_confidence].copy()
+        logger.info(
+            f"FinBERT complete: {len(out):,} retained "
+            f"(dropped {n_before - len(out):,} low-confidence)"
+        )
+        return out.reset_index(drop=True)
+
+    def load_and_process(
+        self,
+        df: pd.DataFrame,
+        text_col: str = "fullText",
+        run_inference: bool = True,
+    ) -> pd.DataFrame:
+        """Convenience wrapper: preprocess + optionally run FinBERT."""
+        df = self.preprocess(df, text_col)
+        if run_inference:
+            df = self.run_finbert(df, text_col="cleaned_text")
+        return df
+
+
+# ============================================================================
+# Sentiment Feature Engineer
+# ============================================================================
+
+class SentimentFeatureEngineer:
+    """
+    Constructs daily sentiment features from tweet-level FinBERT output.
+
+    Input requirements
+    ------------------
+    DataFrame with columns:
+        createdAt     — timestamp of the tweet
+        sentiment     — Positive / Negative / Neutral (from FinBERT)
+        confidence    — FinBERT confidence score
+        retweetCount, replyCount, likeCount, quoteCount, viewCount  (optional)
+    """
+
+    ENGAGEMENT_COLS = ["retweetCount", "replyCount", "likeCount", "quoteCount", "viewCount"]
+    RENAME_MAP = {
+        "retweetCount": "retweet_avg",
+        "replyCount":   "reply_avg",
+        "likeCount":    "like_avg",
+        "quoteCount":   "quote_avg",
+        "viewCount":    "view_avg",
+    }
+
+    def __init__(self, rolling_windows: Optional[List[int]] = None):
+        self.rolling_windows = rolling_windows or [3, 7, 14]
+
+    def build(self, tweet_df: pd.DataFrame) -> pd.DataFrame:
+        """Build daily sentiment features."""
+        df = tweet_df.copy()
+        if "createdAt" not in df.columns:
+            raise ValueError("Tweet DataFrame must include 'createdAt' column.")
+        if "sentiment" not in df.columns:
+            raise ValueError("Tweet DataFrame must include 'sentiment' column.")
+        if "confidence" not in df.columns:
+            raise ValueError("Tweet DataFrame must include 'confidence' column.")
+
+        df["date"] = pd.to_datetime(df["createdAt"]).dt.date
+
+        # ── Engagement aggregation ────────────────────────────────────────────
+        avail_eng = [c for c in self.ENGAGEMENT_COLS if c in df.columns]
+        if avail_eng:
+            engagement_df = (
+                df.groupby("date")
+                .agg({c: "mean" for c in avail_eng})
+                .rename(columns=self.RENAME_MAP)
+                .reset_index()
+            )
+        else:
+            engagement_df = df[["date"]].drop_duplicates().copy()
+            for v in self.RENAME_MAP.values():
+                engagement_df[v] = 0.0
+
+        # ── Per-sentiment daily stats ─────────────────────────────────────────
+        sent_frames = []
+        for label in ("Positive", "Negative", "Neutral"):
+            sub = df[df["sentiment"] == label]
+            if len(sub) == 0:
+                continue
+            agg = (
+                sub.groupby("date")
+                .agg(
+                    **{f"{label.lower()}_count":      ("confidence", "size")},
+                    **{f"{label.lower()}_confidence": ("confidence", "mean")},
+                )
+                .reset_index()
+            )
+            sent_frames.append(agg)
+
+        daily = engagement_df.copy()
+        for sf in sent_frames:
+            daily = daily.merge(sf, on="date", how="left")
+
+        # Fill missing sentiment columns
+        for col in [
+            "positive_count", "negative_count", "neutral_count",
+            "positive_confidence", "negative_confidence", "neutral_confidence",
+        ]:
+            if col not in daily.columns:
+                daily[col] = 0.0
+        daily = daily.fillna(0)
+
+        # ── Derived features ──────────────────────────────────────────────────
+        daily["total_tweets"] = (
+            daily["positive_count"]
+            + daily["negative_count"]
+            + daily["neutral_count"]
+        )
+        for pol in ("positive", "negative", "neutral"):
+            daily[f"{pol}_ratio"] = np.where(
+                daily["total_tweets"] > 0,
+                daily[f"{pol}_count"] / daily["total_tweets"],
+                0.0,
+            )
+
+        # Engagement-weighted sentiment using log-transformed like_avg
+        like_col = "like_avg" if "like_avg" in daily.columns else None
+        like_weight = np.log1p(daily[like_col]) if like_col else pd.Series(
+            np.ones(len(daily)), index=daily.index
+        )
+        daily["engagement_weighted_positive"] = (
+            daily["positive_count"] * daily["positive_confidence"] * like_weight
+        )
+        daily["engagement_weighted_negative"] = (
+            daily["negative_count"] * daily["negative_confidence"] * like_weight
+        )
+        daily["net_sentiment"]   = daily["positive_count"] - daily["negative_count"]
+        daily["sentiment_score"] = (
+            daily["engagement_weighted_positive"] - daily["engagement_weighted_negative"]
+        )
+
+        # Shannon entropy — sentiment diversity
+        eps = 1e-9
+        daily["sentiment_diversity"] = -(
+            daily["positive_ratio"].clip(lower=eps) * np.log(daily["positive_ratio"].clip(lower=eps))
+            + daily["negative_ratio"].clip(lower=eps) * np.log(daily["negative_ratio"].clip(lower=eps))
+            + daily["neutral_ratio"].clip(lower=eps)  * np.log(daily["neutral_ratio"].clip(lower=eps))
+        )
+
+        # ── Sort by date before rolling ───────────────────────────────────────
+        daily = daily.sort_values("date").reset_index(drop=True)
+
+        # ── Rolling features ──────────────────────────────────────────────────
+        rolling_spec = {
+            "net_sentiment":                "rolling_net_sentiment",
+            "positive_ratio":               "rolling_positive_ratio",
+            "sentiment_score":              "rolling_sentiment_score",
+            "sentiment_diversity":          "rolling_diversity",
+            "engagement_weighted_positive": "rolling_ewp",
+        }
+        for src, prefix in rolling_spec.items():
+            for w in self.rolling_windows:
+                daily[f"{prefix}_{w}d"] = daily[src].rolling(w, min_periods=1).mean()
+
+        # ── 1-day lag features ────────────────────────────────────────────────
+        lag_cols = [
+            "positive_ratio", "net_sentiment", "sentiment_diversity",
+            "engagement_weighted_positive", "sentiment_score",
+        ]
+        for col in lag_cols:
+            daily[f"lag1_{col}"] = daily[col].shift(1)
+
+        daily = daily.dropna(subset=["lag1_positive_ratio"]).reset_index(drop=True)
+
+        logger.info(
+            f"Sentiment features: {len(daily)} daily rows, {len(daily.columns)} columns"
+        )
+        return daily
+
+
+# ============================================================================
+# Technical Feature Engineer
+# ============================================================================
+
+class TechnicalFeatureEngineer:
+    """Computes OHLCV-derived technical indicators using backward-looking windows."""
+
+    def build(self, ohlcv_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Parameters
+        ----------
+        ohlcv_df : DataFrame with columns open, high, low, close, volume
+                   and a DatetimeIndex or date index.
+        """
+        df = ohlcv_df.copy().sort_index()
+
+        required = {"open", "high", "low", "close", "volume"}
+        missing  = required - set(df.columns)
+        if missing:
+            raise ValueError(f"OHLCV DataFrame missing columns: {missing}")
+
+        # ── Returns ───────────────────────────────────────────────────────────
+        df["daily_return"] = df["close"].pct_change()
+
+        prev_close = df["close"].shift(1)
+        safe_ratio = df["close"] / prev_close.replace(0, np.nan)
+        df["log_return"] = np.log(safe_ratio.where(safe_ratio > 0, np.nan))
+
+        # ── Moving averages ───────────────────────────────────────────────────
+        for w in [7, 14, 21]:
+            df[f"sma_{w}"] = df["close"].rolling(w, min_periods=1).mean()
+        df["ema_12"] = df["close"].ewm(span=12, adjust=False).mean()
+        df["ema_26"] = df["close"].ewm(span=26, adjust=False).mean()
+        df["sma_crossover"] = (df["sma_7"] > df["sma_14"]).astype(float)
+
+        # ── RSI ──────────────────────────────────────────────────────────────
+        df["rsi_14"] = self._rsi(df["close"], 14)
+
+        # ── MACD ─────────────────────────────────────────────────────────────
+        df["macd"]           = df["ema_12"] - df["ema_26"]
+        df["macd_signal"]    = df["macd"].ewm(span=9, adjust=False).mean()
+        df["macd_histogram"] = df["macd"] - df["macd_signal"]
+
+        # ── Price momentum ───────────────────────────────────────────────────
+        df["price_momentum_5d"]  = df["close"].pct_change(5)
+        df["price_momentum_10d"] = df["close"].pct_change(10)
+
+        # ── Volatility ───────────────────────────────────────────────────────
+        df["volatility_7d"]  = df["daily_return"].rolling(7,  min_periods=2).std()
+        df["volatility_14d"] = df["daily_return"].rolling(14, min_periods=2).std()
+        df["atr_14"]         = self._atr(df, 14)
+
+        # ── Bollinger Bands ──────────────────────────────────────────────────
+        bb_mean = df["close"].rolling(20, min_periods=5).mean()
+        bb_std  = df["close"].rolling(20, min_periods=5).std()
+        df["bollinger_upper"] = bb_mean + 2 * bb_std
+        df["bollinger_lower"] = bb_mean - 2 * bb_std
+        df["bollinger_width"] = (df["bollinger_upper"] - df["bollinger_lower"]) / (bb_mean + 1e-9)
+        df["bollinger_pct"]   = (df["close"] - df["bollinger_lower"]) / (
+            (df["bollinger_upper"] - df["bollinger_lower"]) + 1e-9
+        )
+
+        # ── Volume ───────────────────────────────────────────────────────────
+        df["volume_sma_10"] = df["volume"].rolling(10, min_periods=1).mean()
+        df["volume_ratio"]  = df["volume"] / (df["volume_sma_10"] + 1e-9)
+        df["obv"]           = self._obv(df)
+
+        # ── Price structure ──────────────────────────────────────────────────
+        df["high_low_ratio"]   = df["high"] / (df["low"] + 1e-9)
+        df["close_open_ratio"] = df["close"] / (df["open"] + 1e-9)
+        df["price_position"]   = (df["close"] - df["low"]) / ((df["high"] - df["low"]) + 1e-9)
+
+        # ── Lag returns ──────────────────────────────────────────────────────
+        for lag in [1, 2, 3]:
+            df[f"lag{lag}_return"] = df["daily_return"].shift(lag)
+
+        df = df.dropna(subset=["daily_return", "rsi_14", "macd"])
+        logger.info(f"Technical features: {len(df)} trading days, {len(df.columns)} columns")
+        return df
+
+    @staticmethod
+    def _rsi(prices: pd.Series, window: int = 14) -> pd.Series:
+        """Wilder's RSI."""
+        delta    = prices.diff()
+        gain     = delta.clip(lower=0)
+        loss     = (-delta.clip(upper=0))
+        avg_gain = gain.ewm(com=window - 1, min_periods=window).mean()
+        avg_loss = loss.ewm(com=window - 1, min_periods=window).mean()
+        rs       = avg_gain / (avg_loss + 1e-9)
+        return 100 - (100 / (1 + rs))
+
+    @staticmethod
+    def _atr(df: pd.DataFrame, window: int = 14) -> pd.Series:
+        """Average True Range."""
+        hl  = df["high"] - df["low"]
+        hpc = (df["high"] - df["close"].shift(1)).abs()
+        lpc = (df["low"]  - df["close"].shift(1)).abs()
+        tr  = pd.concat([hl, hpc, lpc], axis=1).max(axis=1)
+        return tr.ewm(com=window - 1, min_periods=window).mean()
+
+    @staticmethod
+    def _obv(df: pd.DataFrame) -> pd.Series:
+        """On-Balance Volume."""
+        direction = np.sign(df["close"].diff()).fillna(0)
+        return (direction * df["volume"]).cumsum()
+
+
+# ============================================================================
+# Statistical Validator
+# ============================================================================
+
+class StatisticalValidator:
+    """Statistical testing and diagnostics utilities."""
+
+    def __init__(self, confidence_level: float = 0.95, random_state: int = 42):
+        self.confidence_level = confidence_level
+        self.random_state     = random_state
+        np.random.seed(random_state)
+
+    def check_all_assumptions(
+        self,
+        y_true: np.ndarray,
+        y_pred: np.ndarray,
+        X_matrix: np.ndarray,
+        feature_names: List[str],
+    ) -> AssumptionTestResults:
+        """Run diagnostics on residuals and multicollinearity checks."""
+        residuals = y_true - y_pred
+        res       = AssumptionTestResults()
+
+        # Residual summary statistics
+        res.residual_mean     = float(np.mean(residuals))
+        res.residual_std      = float(np.std(residuals))
+        res.residual_skew     = float(stats.skew(residuals))
+        res.residual_kurtosis = float(stats.kurtosis(residuals))
+
+        # ── Linearity proxy: residuals should not correlate strongly with fitted ──
+        if np.std(y_pred) > 1e-12 and np.std(residuals) > 1e-12:
+            corr = float(np.corrcoef(y_pred, residuals)[0, 1])
+        else:
+            corr = 0.0
+        res.residual_pred_corr = corr
+        res.linearity_pass = abs(corr) < 0.10
+
+        # ── Independence ──────────────────────────────────────────────────────
+        res.durbin_watson_stat = float(durbin_watson(residuals))
+        res.independence_pass  = 1.5 < res.durbin_watson_stat < 2.5
+        try:
+            lb = acorr_ljungbox(residuals, lags=[10], return_df=True)
+            res.ljung_box_stat = float(lb["lb_stat"].iloc[0])
+            res.ljung_box_p    = float(lb["lb_pvalue"].iloc[0])
+        except Exception:
+            res.ljung_box_p = 1.0
+
+        # ── Normality ─────────────────────────────────────────────────────────
+        sample = residuals
+        if len(residuals) > 5_000:
+            rng    = np.random.default_rng(self.random_state)
+            sample = rng.choice(residuals, 5_000, replace=False)
+        sw_stat, sw_p         = stats.shapiro(sample)
+        res.shapiro_wilk_stat = float(sw_stat)
+        res.shapiro_wilk_p    = float(sw_p)
+        jb_stat, jb_p         = jarque_bera(residuals)
+        res.jarque_bera_stat  = float(jb_stat)
+        res.jarque_bera_p     = float(jb_p)
+        res.normality_pass    = (sw_p > 0.05) and (jb_p > 0.05)
+
+        # ── Homoscedasticity ──────────────────────────────────────────────────
+        X_const = sm.add_constant(X_matrix)
+        try:
+            bp_stat, bp_p, _, _        = het_breuschpagan(residuals, X_const)
+            res.breusch_pagan_stat     = float(bp_stat)
+            res.breusch_pagan_p        = float(bp_p)
+            res.homoscedasticity_pass  = bp_p > 0.05
+        except Exception:
+            res.breusch_pagan_p        = 1.0
+            res.homoscedasticity_pass  = True
+
+        # ── Multicollinearity (VIF) ───────────────────────────────────────────
+        if X_matrix.shape[1] > 1:
+            vif_dict, high_vif = {}, []
+            for i in range(X_matrix.shape[1]):
+                name = feature_names[i] if i < len(feature_names) else f"x{i}"
+                try:
+                    v = variance_inflation_factor(X_const, i + 1)
+                    vif_dict[name] = float(v)
+                    if v > 10.0:
+                        high_vif.append(name)
+                except Exception:
+                    vif_dict[name] = 0.0
+            res.vif_values             = vif_dict
+            res.max_vif                = float(max(vif_dict.values())) if vif_dict else 0.0
+            res.mean_vif               = float(np.mean(list(vif_dict.values()))) if vif_dict else 0.0
+            res.high_vif_features      = high_vif
+            res.multicollinearity_pass = res.max_vif < 10.0
+        else:
+            res.multicollinearity_pass = True
+
+        res.all_pass = (
+            res.linearity_pass
+            and res.independence_pass
+            and res.normality_pass
+            and res.homoscedasticity_pass
+            and res.multicollinearity_pass
+        )
+        return res
+
+    def run_ols_inference(
+        self,
+        y_train: np.ndarray,
+        X_train_scaled: np.ndarray,
+        feature_names: List[str],
+    ) -> InferenceResults:
+        """
+        Statsmodels OLS inference on the provided design matrix.
+        (Note: if your predictive model is Ridge/Lasso, interpret these OLS
+        p-values as a descriptive / comparative inference layer.)
+        """
+        X_sm  = sm.add_constant(X_train_scaled)
+        ols   = sm.OLS(y_train, X_sm).fit()
+
+        names = ["intercept"] + list(feature_names)
+        ci    = ols.conf_int(alpha=1 - self.confidence_level)
+
+        coeff_df = pd.DataFrame({
+            "feature":         names,
+            "coefficient":     ols.params,
+            "std_error":       ols.bse,
+            "t_stat":          ols.tvalues,
+            "p_value":         ols.pvalues,
+            "ci_lower":        ci[0],
+            "ci_upper":        ci[1],
+            "abs_coefficient": np.abs(ols.params),
+            "significant":     ols.pvalues < (1 - self.confidence_level),
+        }).reset_index(drop=True)
+
+        return InferenceResults(
+            coefficients     = coeff_df,
+            f_stat           = float(ols.fvalue),
+            f_pvalue         = float(ols.f_pvalue),
+            adj_r2           = float(ols.rsquared_adj),
+            aic              = float(ols.aic),
+            bic              = float(ols.bic),
+            condition_number = float(np.linalg.cond(X_sm)),
+            n_obs            = int(ols.nobs),
+            df_resid         = int(ols.df_resid),
+        )
+
+    def nested_f_test(
+        self,
+        y: np.ndarray,
+        y_pred_restricted: np.ndarray,
+        y_pred_full: np.ndarray,
+        k_restricted: int,
+        k_full: int,
+    ) -> Tuple[float, float]:
+        """Nested F-test comparing restricted vs full model SSE."""
+        n     = len(y)
+        sse_r = float(np.sum((y - y_pred_restricted) ** 2))
+        sse_f = float(np.sum((y - y_pred_full) ** 2))
+        q     = k_full - k_restricted
+        dof_f = n - k_full - 1
+
+        if dof_f <= 0 or q <= 0 or sse_f <= 0:
+            return 0.0, 1.0
+
+        f_stat = ((sse_r - sse_f) / q) / (sse_f / dof_f)
+        p_val  = float(1 - stats.f.cdf(f_stat, dfn=q, dfd=dof_f))
+        return float(f_stat), p_val
+
+    def bootstrap_delta_r2(
+        self,
+        y: np.ndarray,
+        y_pred_baseline: np.ndarray,
+        y_pred_full: np.ndarray,
+        n_iter: int = 1_000,
+    ) -> Tuple[float, float, float, np.ndarray]:
+        """Bootstrap CI for ΔR² = R²(full) − R²(baseline)."""
+        n      = len(y)
+        deltas = np.empty(n_iter)
+        rng    = np.random.default_rng(self.random_state)
+
+        for i in range(n_iter):
+            idx       = rng.integers(0, n, size=n)
+            r2_b      = r2_score(y[idx], y_pred_baseline[idx])
+            r2_f      = r2_score(y[idx], y_pred_full[idx])
+            deltas[i] = r2_f - r2_b
+
+        alpha    = (1 - self.confidence_level) / 2
+        ci_lo    = float(np.percentile(deltas, 100 * alpha))
+        ci_hi    = float(np.percentile(deltas, 100 * (1 - alpha)))
+        observed = float(r2_score(y, y_pred_full) - r2_score(y, y_pred_baseline))
+
+        return observed, ci_lo, ci_hi, deltas
+
+    @staticmethod
+    def no_information_benchmarks(y_train: np.ndarray, y_test: np.ndarray) -> Dict[str, float]:
+        """R² and RMSE for random-walk (predict 0) and mean predictor."""
+        mean_const = np.full_like(y_test, np.mean(y_train))
+        zero_const = np.zeros_like(y_test)
+        return {
+            "random_walk_r2":    float(r2_score(y_test, zero_const)),
+            "mean_predictor_r2": float(r2_score(y_test, mean_const)),
+            "random_walk_rmse":  float(np.sqrt(mean_squared_error(y_test, zero_const))),
+            "mean_pred_rmse":    float(np.sqrt(mean_squared_error(y_test, mean_const))),
+        }
+
+
+# ============================================================================
+# Core SentimentEngagementAnalyzer
+# ============================================================================
+
+class SentimentEngagementAnalyzer:
+    """
+    End-to-end pipeline for sentiment-enhanced Tesla stock return prediction.
+
+    Public API
+    ----------
+    fit(stock_df, tweet_df)
+    predict(new_data, return_intervals, variant)
+    summary()
+    plot(kind)
+    get_feature_importance()
+    get_metrics()
+    check_assumptions()
+
+    Notes on Prediction Intervals
+    -----------------------------
+    If available, intervals are conformal: ŷ ± q̂ where q̂ is calibrated from
+    training residuals for the requested model variant. This is distribution-free
+    and tends to be more robust than t-based intervals under non-normal errors.
+    """
+
+    BASELINE_FEATURES = [
+        "close", "volume",
+        "sma_7", "sma_14", "sma_21",
+        "ema_12", "ema_26",
+        "rsi_14",
+        "macd", "macd_signal", "macd_histogram",
+        "volatility_7d", "volatility_14d",
+        "atr_14",
+        "bollinger_width", "bollinger_pct",
+        "volume_ratio",
+        "price_position", "high_low_ratio", "close_open_ratio",
+        "price_momentum_5d",
+        "sma_crossover",
+        "lag1_return", "lag2_return", "lag3_return",
+    ]
+
+    SENTIMENT_FEATURES = [
+        "positive_count", "negative_count", "neutral_count",
+        "positive_ratio", "negative_ratio",
+        "positive_confidence", "negative_confidence",
+        "engagement_weighted_positive", "engagement_weighted_negative",
+        "net_sentiment", "sentiment_score", "sentiment_diversity",
+        "rolling_net_sentiment_3d", "rolling_net_sentiment_7d",
+        "rolling_positive_ratio_3d", "rolling_positive_ratio_7d",
+        "rolling_sentiment_score_3d", "rolling_diversity_7d",
+        "rolling_ewp_7d",
+        "lag1_positive_ratio", "lag1_net_sentiment",
+        "lag1_sentiment_diversity", "lag1_engagement_weighted_positive",
+        "lag1_sentiment_score",
+    ]
+
+    TARGET = "daily_return"
+
+    def __init__(self, config: Optional[ModelConfig] = None):
+        self.config       = config or ModelConfig()
+        self._results:    Dict[str, ModelResults] = {}
+        self._merged_df:  Optional[pd.DataFrame]  = None
+        self._benchmarks: Dict[str, float]        = {}
+        self._is_fitted   = False
+
+    def fit(self, stock_df: pd.DataFrame, tweet_df: pd.DataFrame) -> "SentimentEngagementAnalyzer":
+        """Full training pipeline."""
+        self._log("=" * 68)
+        self._log("  SentimentEngagementAnalyzer  —  fit()")
+        self._log("=" * 68)
+
+        tech_eng = TechnicalFeatureEngineer()
+        sent_eng = SentimentFeatureEngineer(self.config.rolling_windows)
+
+        stock_features  = tech_eng.build(stock_df)
+        sentiment_daily = sent_eng.build(tweet_df)
+
+        # Normalise index types for merging on date
+        stock_features.index    = pd.to_datetime(stock_features.index).normalize().date
+        sentiment_daily["date"] = pd.to_datetime(sentiment_daily["date"]).apply(
+            lambda d: d.date() if hasattr(d, "date") else d
+        )
+
+        merged = stock_features.merge(
+            sentiment_daily,
+            left_index=True,
+            right_on="date",
+            how="inner",
+        ).set_index("date")
+
+        # Winsorise at 1st/99th percentile (fit-time robustness)
+        # Note: clipping uses full merged sample here; if you want strict purity,
+        # compute quantiles on train only and apply to both.
+        for col in [self.TARGET] + [f for f in self.BASELINE_FEATURES if f in merged.columns]:
+            lo, hi = merged[col].quantile([0.01, 0.99])
+            merged[col] = merged[col].clip(lo, hi)
+
+        self._merged_df = merged.dropna(subset=[self.TARGET]).sort_index()
+
+        n_total  = len(self._merged_df)
+        n_test   = max(int(n_total * self.config.test_size), 30)
+        n_train  = n_total - n_test
+        train_df = self._merged_df.iloc[:n_train]
+        test_df  = self._merged_df.iloc[n_train:]
+
+        self._log(
+            f"\n  Dataset     : {n_total:,} trading days  "
+            f"({self._merged_df.index[0]} → {self._merged_df.index[-1]})"
+        )
+        self._log(
+            f"  Train       : {train_df.index[0]} → {train_df.index[-1]}  "
+            f"({n_train:,} obs)"
+        )
+        self._log(
+            f"  Test        : {test_df.index[0]}  → {test_df.index[-1]}   "
+            f"({n_test:,} obs)"
+        )
+
+        validator = StatisticalValidator(self.config.confidence_level, self.config.random_state)
+        self._benchmarks = validator.no_information_benchmarks(
+            train_df[self.TARGET].values, test_df[self.TARGET].values
+        )
+        self._log(
+            f"\n  Benchmarks  : random_walk R²={self._benchmarks['random_walk_r2']:.4f}  "
+            f"mean_predictor R²={self._benchmarks['mean_predictor_r2']:.4f}"
+        )
+
+        self._log("\n  [1/2] Training baseline model (OHLCV only)...")
+        self._train_model(train_df, test_df, FeatureSet.BASELINE, validator)
+
+        self._log("  [2/2] Training sentiment-enhanced model (OHLCV + sentiment)...")
+        self._train_model(train_df, test_df, FeatureSet.FULL, validator)
+
+        base       = self._results[FeatureSet.BASELINE.value]
+        full       = self._results[FeatureSet.FULL.value]
+        y_test_arr = full.y_test
+
+        f_stat, f_p = validator.nested_f_test(
+            y_test_arr,
+            base.y_pred_test,
+            full.y_pred_test,
+            k_restricted=len(base.features_used),
+            k_full=len(full.features_used),
+        )
+
+        self._log(f"  Running {self.config.bootstrap_n:,} bootstrap iterations for ΔR² CI...")
+        delta_obs, ci_lo, ci_hi, all_deltas = validator.bootstrap_delta_r2(
+            y_test_arr,
+            base.y_pred_test,
+            full.y_pred_test,
+            n_iter=self.config.bootstrap_n,
+        )
+
+        full.nested_f_stat      = f_stat
+        full.nested_f_pvalue    = f_p
+        full.bootstrap_delta_r2 = delta_obs
+        full.bootstrap_ci_lo    = ci_lo
+        full.bootstrap_ci_hi    = ci_hi
+        full.bootstrap_ci_all   = all_deltas
+
+        self._is_fitted = True
+        self._log("\n  Fitting complete.")
+
+        if self.config.verbose:
+            self.summary()
+
+        return self
+
+    def _predict_from_variant(
+        self,
+        new_data: Union[pd.DataFrame, Dict],
+        variant: FeatureSet,
+        return_intervals: bool = False,
+    ) -> pd.DataFrame:
+        """Internal prediction helper for baseline vs full variants."""
+        self._require_fitted()
+
+        if isinstance(new_data, dict):
+            new_data = pd.DataFrame([new_data])
+
+        res = self._results[variant.value]
+        features = res.features_used
+
+        X = pd.DataFrame(index=new_data.index)
+        for f in features:
+            X[f] = new_data[f] if f in new_data.columns else 0.0
+
+        X_scaled = res.scaler.transform(X.fillna(0).values)
+        y_hat    = res.model.predict(X_scaled)
+
+        out = pd.DataFrame({"prediction": y_hat}, index=new_data.index)
+
+        if return_intervals:
+            # Prefer conformal intervals if calibrated
+            if res.conformal_q and res.conformal_q > 0:
+                q = float(res.conformal_q)
+                out["lower"] = y_hat - q
+                out["upper"] = y_hat + q
+                out["interval_width"] = out["upper"] - out["lower"]
+                out["interval_method"] = "conformal"
+            else:
+                # Fallback: t-based using training residual std
+                se = float(np.std(res.residuals_train))
+                k = len(features)
+                n_res = len(res.residuals_train)
+                t_crit = stats.t.ppf(
+                    0.5 + self.config.confidence_level / 2,
+                    df=max(n_res - k - 1, 1),
+                )
+                out["lower"] = y_hat - t_crit * se
+                out["upper"] = y_hat + t_crit * se
+                out["interval_width"] = out["upper"] - out["lower"]
+                out["interval_method"] = "t_resid_sd"
+
+        return out
+
+    def predict(
+        self,
+        new_data: Union[pd.DataFrame, Dict],
+        return_intervals: bool = False,
+        variant: FeatureSet = FeatureSet.FULL,
+    ) -> pd.DataFrame:
+        """
+        Generate predictions from a fitted model variant.
+
+        Parameters
+        ----------
+        variant : FeatureSet.BASELINE or FeatureSet.FULL (default FULL)
+        """
+        return self._predict_from_variant(new_data, variant=variant, return_intervals=return_intervals)
+
+    def summary(self, verbose: bool = True) -> "SentimentEngagementAnalyzer":
+        """Print a comprehensive performance, inference, and diagnostics summary."""
+        self._require_fitted()
+        base = self._results[FeatureSet.BASELINE.value]
+        full = self._results[FeatureSet.FULL.value]
+        W    = 72
+
+        print("\n" + "═" * W)
+        print("  SENTIMENT ENGAGEMENT ANALYZER  —  RESULTS SUMMARY")
+        print("═" * W)
+
+        print("\n  NO-INFORMATION BENCHMARKS")
+        print("  " + "─" * (W - 2))
+        for k, v in self._benchmarks.items():
+            print(f"    {k:<30} {v:>10.4f}")
+
+        print("\n  MODEL PERFORMANCE")
+        print("  " + "─" * (W - 2))
+        hdr = f"  {'Metric':<26} {'Baseline':>12} {'Full Model':>12} {'Δ':>10}"
+        print(hdr)
+        print("  " + "─" * (W - 2))
+        rows = [
+            ("Test R²",       base.test_r2,    full.test_r2,    True),
+            ("Train R²",      base.train_r2,   full.train_r2,   True),
+            ("CV R² (mean)",  base.cv_r2_mean, full.cv_r2_mean, True),
+            ("CV R² (std)",   base.cv_r2_std,  full.cv_r2_std,  False),
+            ("Test RMSE",     base.test_rmse,  full.test_rmse,  False),
+            ("Test MAE",      base.test_mae,   full.test_mae,   False),
+            ("# Features",    float(len(base.features_used)), float(len(full.features_used)), True),
+        ]
+        for name, bv, fv, hib in rows:
+            delta = fv - bv
+            arrow = "▲" if (hib and delta > 0) or (not hib and delta < 0) else "▼"
+            print(f"  {name:<26} {bv:>12.4f} {fv:>12.4f} {arrow}{abs(delta):>8.4f}")
+
+        print("\n  PREDICTION INTERVAL CALIBRATION")
+        print("  " + "─" * (W - 2))
+        if base.conformal_q > 0:
+            print(f"    Baseline conformal q̂  : {base.conformal_q:.6f}  (ŷ ± q̂)")
+        else:
+            print("    Baseline conformal q̂  : N/A (fallback interval will be used)")
+        if full.conformal_q > 0:
+            print(f"    Full model conformal q̂: {full.conformal_q:.6f}  (ŷ ± q̂)")
+        else:
+            print("    Full model conformal q̂: N/A (fallback interval will be used)")
+
+        print("\n  NESTED F-TEST  (H0: sentiment features add no explanatory power)")
+        print("  " + "─" * (W - 2))
+        print(f"    F-statistic           : {full.nested_f_stat:.4f}")
+        print(
+            f"    p-value               : {full.nested_f_pvalue:.4f}  "
+            f"{'✓ reject H0 (p < 0.05)' if full.nested_f_pvalue < 0.05 else '✗ fail to reject H0'}"
+        )
+        print(f"    ΔR² (observed)        : {full.bootstrap_delta_r2:.4f}")
+        print(f"    Bootstrap 95% CI      : [{full.bootstrap_ci_lo:.4f},  {full.bootstrap_ci_hi:.4f}]")
+        excl = full.bootstrap_ci_lo > 0 or full.bootstrap_ci_hi < 0
+        print(f"    CI excludes zero      : {'Yes ✓' if excl else 'No ✗'}")
+
+        inf = full.inference
+        print("\n  FULL MODEL OLS INFERENCE")
+        print("  " + "─" * (W - 2))
+        print(f"    F-test                : F={inf.f_stat:.3f}, p={inf.f_pvalue:.4f}")
+        print(f"    Adjusted R²           : {inf.adj_r2:.4f}")
+        print(f"    AIC                   : {inf.aic:.2f}")
+        print(f"    BIC                   : {inf.bic:.2f}")
+        print(f"    Condition number      : {inf.condition_number:.1f}")
+        print(f"    N observations (train): {inf.n_obs}")
+
+        if not inf.coefficients.empty:
+            sig = inf.coefficients[
+                (inf.coefficients["significant"] == True) & (inf.coefficients["feature"] != "intercept")
+            ].sort_values("abs_coefficient", ascending=False)
+            if len(sig) > 0:
+                print(f"\n  SIGNIFICANT FEATURES (p < {1-self.config.confidence_level:.2f})")
+                print("  " + "─" * (W - 2))
+                print(f"  {'Feature':<34} {'β':>10} {'SE':>8} {'t':>8} {'p':>10}")
+                for _, row in sig.iterrows():
+                    print(
+                        f"  {row['feature']:<34} "
+                        f"{row['coefficient']:>10.4f} "
+                        f"{row['std_error']:>8.4f} "
+                        f"{row['t_stat']:>8.3f} "
+                        f"{row['p_value']:>10.4f}"
+                    )
+
+        if verbose:
+            a = full.assumptions
+            print("\n  DIAGNOSTICS  (Full Model, Test Set Residuals)")
+            print("  " + "─" * (W - 2))
+            tests = [
+                ("Linearity (proxy)",
+                 a.linearity_pass,
+                 f"corr(residual, fitted) = {a.residual_pred_corr:.3f}"),
+                ("Independence",
+                 a.independence_pass,
+                 f"DW = {a.durbin_watson_stat:.3f}, Ljung-Box p = {a.ljung_box_p:.3f}"),
+                ("Normality",
+                 a.normality_pass,
+                 f"Shapiro p = {a.shapiro_wilk_p:.3f}, Jarque-Bera p = {a.jarque_bera_p:.3f}"),
+                ("Homoscedasticity",
+                 a.homoscedasticity_pass,
+                 f"Breusch-Pagan p = {a.breusch_pagan_p:.3f}"),
+                ("Low Multicollinearity",
+                 a.multicollinearity_pass,
+                 f"Max VIF = {a.max_vif:.2f}, Mean VIF = {a.mean_vif:.2f}"),
+            ]
+            for name, passed, detail in tests:
+                status = "PASS ✓" if passed else "FAIL ✗"
+                print(f"  {name:<26} {status:<10}  {detail}")
+            overall = "ALL PASS ✓" if a.all_pass else "SOME FAILURES — check above"
+            print(f"\n  Overall status        : {overall}")
+            if a.high_vif_features:
+                print(f"  High-VIF features     : {', '.join(a.high_vif_features)}")
+
+        print("\n" + "═" * W)
+        return self
+
+    def plot(self, kind: str = "all", figsize: Tuple[int, int] = (16, 10)) -> "SentimentEngagementAnalyzer":
+        """Generate diagnostic and interpretability visualisations."""
+        self._require_fitted()
+        panels = (
+            ["comparison", "timeseries", "diagnostics", "coefficients", "correlation"]
+            if kind == "all" else [kind]
+        )
+        for panel in panels:
+            method = f"_plot_{panel}"
+            if hasattr(self, method):
+                getattr(self, method)(figsize)
+            else:
+                logger.warning(f"Unknown plot kind: '{panel}'")
+        return self
+
+    def get_feature_importance(self) -> pd.DataFrame:
+        """Return coefficients sorted by absolute magnitude, with inference stats."""
+        self._require_fitted()
+        coeff = self._results[FeatureSet.FULL.value].inference.coefficients
+        return (
+            coeff[coeff["feature"] != "intercept"]
+            .sort_values("abs_coefficient", ascending=False)
+            .reset_index(drop=True)
+        )
+
+    def get_metrics(self) -> pd.DataFrame:
+        """Return performance metrics for both the baseline and full models."""
+        self._require_fitted()
+        rows = []
+        for key, res in self._results.items():
+            rows.append({
+                "model":       key,
+                "n_features":  len(res.features_used),
+                "train_r2":    res.train_r2,
+                "test_r2":     res.test_r2,
+                "cv_r2_mean":  res.cv_r2_mean,
+                "cv_r2_std":   res.cv_r2_std,
+                "test_rmse":   res.test_rmse,
+                "test_mae":    res.test_mae,
+                "adj_r2":      res.inference.adj_r2,
+                "aic":         res.inference.aic,
+                "bic":         res.inference.bic,
+                "conformal_q": res.conformal_q,
+            })
+        return pd.DataFrame(rows)
+
+    def check_assumptions(self) -> AssumptionTestResults:
+        """Return diagnostics for the fitted full model."""
+        self._require_fitted()
+        return self._results[FeatureSet.FULL.value].assumptions
+
+    def quick_analysis(self, stock_df: pd.DataFrame, tweet_df: pd.DataFrame) -> "SentimentEngagementAnalyzer":
+        """Convenience method: fit + summary + all plots."""
+        return self.fit(stock_df, tweet_df).plot("all")
+
+    def export_results(self, output_dir: str = ".") -> "SentimentEngagementAnalyzer":
+        """Export metrics and feature importance tables to CSV."""
+        import os
+        self._require_fitted()
+        os.makedirs(output_dir, exist_ok=True)
+        self.get_metrics().to_csv(f"{output_dir}/model_metrics.csv", index=False)
+        self.get_feature_importance().to_csv(f"{output_dir}/feature_importance.csv", index=False)
+        logger.info(f"Results exported to '{output_dir}/'")
+        return self
+
+    # ── Internal ─────────────────────────────────────────────────────────────
+
+    def _get_feature_columns(self, feature_set: FeatureSet) -> List[str]:
+        if feature_set == FeatureSet.BASELINE:
+            pool = self.BASELINE_FEATURES
+        elif feature_set == FeatureSet.SENTIMENT_ONLY:
+            pool = self.SENTIMENT_FEATURES
+        else:
+            pool = self.BASELINE_FEATURES + self.SENTIMENT_FEATURES
+        return [f for f in pool if f in self._merged_df.columns]
+
+    def _apply_feature_selection(
+        self,
+        X_train: np.ndarray,
+        y_train: np.ndarray,
+        feature_names: List[str],
+    ) -> Tuple[np.ndarray, List[str], List[int]]:
+        """Apply configured feature selection strategy."""
+        strategy = self.config.feature_selection
+        n_feat   = len(feature_names)
+
+        if strategy == FeatureSelectionStrategy.ALL_FEATURES:
+            return X_train, feature_names, list(range(n_feat))
+
+        if strategy == FeatureSelectionStrategy.TOP_K:
+            correlations = np.array([
+                abs(np.corrcoef(X_train[:, i], y_train)[0, 1]) if np.std(X_train[:, i]) > 0 else 0.0
+                for i in range(n_feat)
+            ])
+            top_k = min(self.config.top_k_features, n_feat)
+            idx   = list(np.argsort(correlations)[-top_k:])
+            return X_train[:, idx], [feature_names[i] for i in idx], idx
+
+        if strategy == FeatureSelectionStrategy.LOW_COLLINEARITY:
+            keep_idx = list(range(n_feat))
+            changed  = True
+            while changed and len(keep_idx) > 1:
+                changed = False
+                X_sub   = sm.add_constant(X_train[:, keep_idx])
+                vifs    = []
+                for i in range(len(keep_idx)):
+                    try:
+                        vifs.append(variance_inflation_factor(X_sub, i + 1))
+                    except Exception:
+                        vifs.append(0.0)
+                max_i = int(np.argmax(vifs))
+                if vifs[max_i] > self.config.vif_threshold:
+                    keep_idx.pop(max_i)
+                    changed = True
+            return X_train[:, keep_idx], [feature_names[i] for i in keep_idx], keep_idx
+
+        return X_train, feature_names, list(range(n_feat))
+
+    def _build_sklearn_model(self):
+        mt = self.config.model_type
+        if mt == ModelType.RIDGE:
+            return Ridge(alpha=self.config.alpha, random_state=self.config.random_state)
+        if mt == ModelType.LASSO:
+            return Lasso(alpha=self.config.alpha, max_iter=20_000, random_state=self.config.random_state)
+        return LinearRegression()
+
+    @staticmethod
+    def _conformal_quantile(abs_residuals: np.ndarray, alpha: float) -> float:
+        """
+        Split-conformal-style radius based on training residuals.
+        Uses finite-sample correction: q = Quantile_{ceil((n+1)(1-alpha))/n}(|e|)
+        Implemented as q_level = min(1, 1 - alpha + 1/n).
+        """
+        abs_residuals = np.asarray(abs_residuals, dtype=float)
+        abs_residuals = abs_residuals[np.isfinite(abs_residuals)]
+        n = len(abs_residuals)
+        if n == 0:
+            return 0.0
+        q_level = min(1.0, 1.0 - alpha + 1.0 / n)
+        return float(np.quantile(abs_residuals, q_level, method="higher" if hasattr(np, "quantile") else "linear"))
+
+    def _train_model(
+        self,
+        train_df: pd.DataFrame,
+        test_df: pd.DataFrame,
+        feature_set: FeatureSet,
+        validator: StatisticalValidator,
+    ) -> None:
+        """Train one model variant and store complete results."""
+        candidate_features = self._get_feature_columns(feature_set)
+
+        X_train_raw = train_df[candidate_features].fillna(0).values
+        y_train     = train_df[self.TARGET].values
+        X_test_raw  = test_df[candidate_features].fillna(0).values
+        y_test      = test_df[self.TARGET].values
+
+        # Feature selection (fit only on training data)
+        X_train_sel, sel_features, sel_idx = self._apply_feature_selection(
+            X_train_raw, y_train, candidate_features
+        )
+        X_test_sel = X_test_raw[:, sel_idx]
+
+        # Standardise (fit only on training data)
+        scaler     = StandardScaler()
+        X_train_sc = scaler.fit_transform(X_train_sel)
+        X_test_sc  = scaler.transform(X_test_sel)
+
+        model        = self._build_sklearn_model()
+        model.fit(X_train_sc, y_train)
+        y_pred_train = model.predict(X_train_sc)
+        y_pred_test  = model.predict(X_test_sc)
+
+        # Fold-correct CV: scale inside each fold via Pipeline (prevents leakage)
+        tscv = TimeSeriesSplit(n_splits=self.config.cv_folds)
+        cv_pipe = Pipeline([
+            ("scaler", StandardScaler()),
+            ("model", self._build_sklearn_model()),
+        ])
+        cv_scores = cross_val_score(
+            cv_pipe,
+            X_train_sel, y_train,   # unscaled
+            cv=tscv,
+            scoring="r2",
+        )
+
+        # OLS inference (descriptive layer)
+        inference = validator.run_ols_inference(y_train, X_train_sc, sel_features)
+
+        # Diagnostics on test residuals (scaled design matrix for VIF/diagnostics)
+        assumptions = validator.check_all_assumptions(y_test, y_pred_test, X_test_sc, sel_features)
+
+        # Conformal interval calibration from training residuals
+        alpha = 1.0 - float(self.config.confidence_level)
+        conformal_q = self._conformal_quantile(np.abs(y_train - y_pred_train), alpha=alpha)
+
+        res = ModelResults(
+            feature_set     = feature_set.value,
+            features_used   = sel_features,
+            train_r2        = float(r2_score(y_train, y_pred_train)),
+            test_r2         = float(r2_score(y_test, y_pred_test)),
+            train_rmse      = float(np.sqrt(mean_squared_error(y_train, y_pred_train))),
+            test_rmse       = float(np.sqrt(mean_squared_error(y_test, y_pred_test))),
+            train_mae       = float(mean_absolute_error(y_train, y_pred_train)),
+            test_mae        = float(mean_absolute_error(y_test, y_pred_test)),
+            train_mse       = float(mean_squared_error(y_train, y_pred_train)),
+            test_mse        = float(mean_squared_error(y_test, y_pred_test)),
+            cv_r2_scores    = cv_scores,
+            cv_r2_mean      = float(cv_scores.mean()),
+            cv_r2_std       = float(cv_scores.std()),
+            y_train         = y_train,
+            y_pred_train    = y_pred_train,
+            y_test          = y_test,
+            y_pred_test     = y_pred_test,
+            residuals_train = y_train - y_pred_train,
+            residuals_test  = y_test  - y_pred_test,
+            test_index      = test_df.index,
+            conformal_q     = float(conformal_q),
+            inference       = inference,
+            assumptions     = assumptions,
+            scaler          = scaler,
+            model           = model,
+        )
+        self._results[feature_set.value] = res
+
+        label = feature_set.value.upper().replace("_", " ")
+        self._log(
+            f"    [{label}]  "
+            f"features={len(sel_features)}  "
+            f"test_R²={res.test_r2:.4f}  "
+            f"RMSE={res.test_rmse:.4f}  "
+            f"MAE={res.test_mae:.4f}  "
+            f"CV_R²={res.cv_r2_mean:.4f}±{res.cv_r2_std:.4f}  "
+            f"q̂={res.conformal_q:.6f}"
+        )
+
+    # ── Plotting ─────────────────────────────────────────────────────────────
+
+    def _plot_comparison(self, figsize: Tuple) -> None:
+        base = self._results[FeatureSet.BASELINE.value]
+        full = self._results[FeatureSet.FULL.value]
+
+        fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+        fig.suptitle(
+            "Comparison of Baseline and Sentiment-Enhanced Model Performance\n"
+            "with Confidence Indicators",
+            fontsize=13, fontweight="bold", y=1.01,
+        )
+
+        BLUE, GREEN = "#4C72B0", "#55A868"
+        xlabels     = ["Baseline\n(Stock Only)", "Sentiment-Enhanced\n(Stock + Sentiment)"]
+
+        metrics = [
+            ("(a) Coefficient of Determination", "R² Score",
+             [base.test_r2, full.test_r2],
+             [base.cv_r2_std, full.cv_r2_std]),
+            ("(b) Root Mean Squared Error", "RMSE",
+             [base.test_rmse, full.test_rmse], None),
+            ("(c) Mean Absolute Error", "MAE",
+             [base.test_mae, full.test_mae], None),
+        ]
+
+        for ax, (title, ylabel, vals, errs) in zip(axes, metrics):
+            bars = ax.bar(xlabels, vals, color=[BLUE, GREEN],
+                          width=0.5, edgecolor="white", linewidth=0.5)
+            if errs is not None:
+                ax.errorbar([0, 1], vals, yerr=errs, fmt="none", color="black", capsize=5, linewidth=1.5)
+            for bar, val in zip(bars, vals):
+                ax.text(
+                    bar.get_x() + bar.get_width() / 2,
+                    bar.get_height() + abs(max(vals) - min(vals)) * 0.05,
+                    f"{val:.4f}", ha="center", va="bottom",
+                    fontsize=10, fontweight="bold",
+                )
+            delta = vals[1] - vals[0]
+            sign  = "+" if delta > 0 else ""
+            ax.text(
+                0.5, 0.97,
+                f"Δ = {sign}{delta:.4f}\nF={full.nested_f_stat:.2f}, p={full.nested_f_pvalue:.3f}",
+                transform=ax.transAxes, ha="center", va="top",
+                fontsize=8, color="#333333",
+                bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="grey", alpha=0.7),
+            )
+            spread = abs(max(vals) - min(vals))
+            ax.set_ylim(min(vals) - spread * 0.8, max(vals) + spread * 3.5)
+            ax.set_title(title, fontsize=10, fontweight="bold")
+            ax.set_ylabel(ylabel, fontsize=9)
+            ax.grid(axis="y", alpha=0.3, linestyle="--")
+            ax.spines[["top", "right"]].set_visible(False)
+
+        plt.tight_layout()
+        plt.show()
+
+    def _plot_timeseries(self, figsize: Tuple) -> None:
+        base = self._results[FeatureSet.BASELINE.value]
+        full = self._results[FeatureSet.FULL.value]
+
+        try:
+            idx = pd.to_datetime(full.test_index)
+        except Exception:
+            idx = np.arange(len(full.y_test))
+
+        # Prediction intervals: use conformal if available, else fallback
+        if full.conformal_q and full.conformal_q > 0:
+            q = float(full.conformal_q)
+            pi_lo = full.y_pred_test - q
+            pi_hi = full.y_pred_test + q
+            interval_label = f"{int(self.config.confidence_level*100)}% Conformal Interval (ŷ ± q̂)"
+        else:
+            se     = np.std(full.residuals_train)
+            k      = len(full.features_used)
+            n_res  = len(full.residuals_train)
+            t_crit = stats.t.ppf(0.5 + self.config.confidence_level / 2, df=max(n_res - k - 1, 1))
+            pi_lo  = full.y_pred_test - t_crit * se
+            pi_hi  = full.y_pred_test + t_crit * se
+            interval_label = f"{int(self.config.confidence_level*100)}% Interval (t-resid SD)"
+
+        coverage = float(np.mean((full.y_test >= pi_lo) & (full.y_test <= pi_hi)))
+
+        fig, ax = plt.subplots(figsize=(16, 6))
+        ax.fill_between(idx, pi_lo, pi_hi, alpha=0.18, color="#55A868",
+                        label=interval_label)
+        ax.plot(idx, full.y_test, color="black", lw=1.5, label="Actual Returns", zorder=5)
+        ax.plot(idx, base.y_pred_test, color="#4C72B0", lw=0.9, ls="--",
+                label="Baseline Predictions", alpha=0.75)
+        ax.plot(idx, full.y_pred_test, color="#55A868", lw=0.9, ls="--",
+                label="Sentiment-Enhanced Predictions", alpha=0.9)
+        ax.axhline(0, color="grey", lw=0.5, ls=":")
+        ax.set_xlabel("Date", fontsize=11)
+        ax.set_ylabel("Daily Return", fontsize=11)
+        ax.set_title(
+            "Tesla Stock Return Predictions: Test Period\nBaseline vs Sentiment-Enhanced Model",
+            fontsize=12, fontweight="bold",
+        )
+        ax.legend(fontsize=9, loc="upper left")
+        ax.text(
+            0.985, 0.04,
+            f"Sentiment-Enhanced Model\n"
+            f"R²   = {full.test_r2:.3f}\n"
+            f"RMSE = {full.test_rmse:.3f}\n"
+            f"MAE  = {full.test_mae:.3f}\n"
+            f"Coverage = {coverage:.1%}",
+            transform=ax.transAxes, ha="right", va="bottom",
+            fontsize=8.5,
+            bbox=dict(boxstyle="round,pad=0.4", fc="white", ec="grey", alpha=0.85),
+        )
+        ax.grid(alpha=0.2)
+        ax.spines[["top", "right"]].set_visible(False)
+        plt.tight_layout()
+        plt.show()
+
+    def _plot_diagnostics(self, figsize: Tuple) -> None:
+        full = self._results[FeatureSet.FULL.value]
+        a    = full.assumptions
+
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+        fig.suptitle("Diagnostic Plots — Sentiment-Enhanced Model (Test Residuals)",
+                     fontsize=13, fontweight="bold")
+
+        ax = axes[0, 0]
+        ax.scatter(full.y_pred_test, full.y_test, alpha=0.45, s=18, color="#4C72B0", edgecolors="none")
+        lo = min(full.y_pred_test.min(), full.y_test.min())
+        hi = max(full.y_pred_test.max(), full.y_test.max())
+        ax.plot([lo, hi], [lo, hi], "r--", lw=1.5, label="Perfect prediction")
+        ax.set_xlabel("Predicted Returns"); ax.set_ylabel("Actual Returns")
+        ax.set_title("(a) Actual vs. Predicted")
+        ax.legend(fontsize=8); ax.grid(alpha=0.3)
+        ax.text(0.05, 0.95, f"R² = {full.test_r2:.3f}", transform=ax.transAxes,
+                fontsize=10, va="top",
+                bbox=dict(boxstyle="round", fc="#fffacd", ec="orange", alpha=0.9))
+
+        ax = axes[0, 1]
+        ax.scatter(full.y_pred_test, full.residuals_test, alpha=0.45, s=18, color="#55A868", edgecolors="none")
+        ax.axhline(0, color="red", lw=1.5, ls="--")
+        mean_res = full.residuals_test.mean()
+        ax.axhline(mean_res, color="blue", lw=1.0, ls=":", label=f"Mean = {mean_res:.5f}")
+        ax.set_xlabel("Predicted"); ax.set_ylabel("Residuals")
+        ax.set_title(f"(b) Residuals vs. Predicted\nDW={a.durbin_watson_stat:.3f}  BP p={a.breusch_pagan_p:.3f}")
+        ax.legend(fontsize=8); ax.grid(alpha=0.3)
+
+        ax = axes[1, 0]
+        sm.qqplot(full.residuals_test, line="s", ax=ax, alpha=0.5, markersize=3, color="#C44E52")
+        ax.set_title(f"(c) Normal Q-Q\nShapiro p={a.shapiro_wilk_p:.3f}, JB p={a.jarque_bera_p:.3f}")
+        ax.grid(alpha=0.3)
+
+        ax = axes[1, 1]
+        res_std = full.residuals_test / (full.residuals_test.std() + 1e-9)
+        ax.hist(res_std, bins=40, density=True, color="#C44E52", alpha=0.65, edgecolor="white")
+        xr = np.linspace(res_std.min(), res_std.max(), 300)
+        ax.plot(xr, stats.norm.pdf(xr), "b-", lw=2, label="Normal PDF")
+        ax.set_xlabel("Standardised Residuals"); ax.set_ylabel("Density")
+        ax.set_title("(d) Residual Distribution")
+        ax.legend(fontsize=8); ax.grid(alpha=0.3)
+        ax.text(
+            0.97, 0.97,
+            f"Mean: {full.residuals_test.mean():.4f}\n"
+            f"Std:  {full.residuals_test.std():.4f}\n"
+            f"Skew: {a.residual_skew:.3f}\n"
+            f"Kurt: {a.residual_kurtosis:.3f}\n"
+            f"corr(res,fitted): {a.residual_pred_corr:.3f}",
+            transform=ax.transAxes, ha="right", va="top", fontsize=8.5,
+            bbox=dict(boxstyle="round", fc="white", ec="grey", alpha=0.85),
+        )
+
+        plt.tight_layout()
+        plt.show()
+
+    def _plot_coefficients(self, figsize: Tuple) -> None:
+        full  = self._results[FeatureSet.FULL.value]
+        coeff = (
+            full.inference.coefficients
+            .query("feature != 'intercept'")
+            .sort_values("abs_coefficient", ascending=True)
+            .tail(15)
+        )
+
+        def _color(p: float) -> str:
+            if p < 0.001: return "#C44E52"
+            if p < 0.01:  return "#DD8452"
+            if p < 0.05:  return "#CCBB44"
+            return "#BBBBBB"
+
+        colors = [_color(p) for p in coeff["p_value"]]
+
+        fig, ax = plt.subplots(figsize=(12, 7))
+        ax.barh(coeff["feature"], coeff["coefficient"], color=colors, edgecolor="white", linewidth=0.5)
+        ax.errorbar(
+            coeff["coefficient"], range(len(coeff)),
+            xerr=[
+                coeff["coefficient"] - coeff["ci_lower"],
+                coeff["ci_upper"]    - coeff["coefficient"],
+            ],
+            fmt="none", color="black", capsize=3, linewidth=1.2,
+        )
+
+        max_abs = coeff["abs_coefficient"].max()
+        for i, (_, row) in enumerate(coeff.iterrows()):
+            stars = "***" if row["p_value"] < 0.001 else "**" if row["p_value"] < 0.01 else "*" if row["p_value"] < 0.05 else "n.s."
+            x_off = row["ci_upper"] + max_abs * 0.02
+            ax.text(x_off, i, f" {row['coefficient']:.4f} {stars}", va="center", fontsize=8)
+
+        ax.axvline(0, color="black", lw=0.8)
+        ax.set_xlabel("Coefficient Value (β)", fontsize=11)
+        ax.set_title("Feature Importance with Confidence Intervals", fontsize=12, fontweight="bold")
+        ax.grid(axis="x", alpha=0.3, linestyle="--")
+        ax.spines[["top", "right"]].set_visible(False)
+
+        from matplotlib.patches import Patch
+        ax.legend(
+            handles=[
+                Patch(color="#C44E52", label="p < 0.001  (***)"),
+                Patch(color="#DD8452", label="p < 0.01   (**)"),
+                Patch(color="#CCBB44", label="p < 0.05   (*)"),
+                Patch(color="#BBBBBB", label="p ≥ 0.05   (n.s.)"),
+            ],
+            loc="lower right", fontsize=9,
+        )
+        plt.tight_layout()
+        plt.show()
+
+    def _plot_correlation(self, figsize: Tuple) -> None:
+        full  = self._results[FeatureSet.FULL.value]
+        cols  = [self.TARGET] + full.features_used[:20]
+        avail = [c for c in cols if c in self._merged_df.columns]
+        corr  = self._merged_df[avail].corr()
+
+        fig, ax = plt.subplots(figsize=(14, 11))
+        sns.heatmap(
+            corr, annot=True, fmt=".2f", cmap="coolwarm",
+            center=0, vmin=-1, vmax=1,
+            linewidths=0.4, square=True, ax=ax,
+            annot_kws={"size": 7},
+        )
+        ax.set_title("Feature Correlation Matrix with Target Variable",
+                     fontsize=12, fontweight="bold")
+        plt.xticks(rotation=45, ha="right", fontsize=8)
+        plt.yticks(rotation=0, fontsize=8)
+        plt.tight_layout()
+        plt.show()
+
+    # ── Utilities ────────────────────────────────────────────────────────────
+
+    def _log(self, msg: str) -> None:
+        if self.config.verbose:
+            print(msg)
+
+    def _require_fitted(self) -> None:
+        if not self._is_fitted:
+            raise RuntimeError("Model has not been fitted. Call fit(stock_df, tweet_df) first.")
+
+    def __repr__(self) -> str:
+        status = "fitted" if self._is_fitted else "not fitted"
+        return (
+            f"SentimentEngagementAnalyzer("
+            f"model={self.config.model_type.value}, "
+            f"features={self.config.feature_set.value}, "
+            f"status={status})"
+        )
+
+
+# ============================================================================
+# Real-Time Inference Engine
+# ============================================================================
+
+class RealTimeInferenceEngine:
+    """
+    Wraps a fitted SentimentEngagementAnalyzer to provide live stock data
+    retrieval and optional analysis via yfinance.
+
+    Notes
+    -----
+    If live tweet data is not available, it is recommended to use the baseline
+    (technical-only) model variant for realtime predictions.
+    """
+
+    SECTOR_ETFS = {
+        "Technology":             "XLK",
+        "Healthcare":             "XLV",
+        "Financials":             "XLF",
+        "Energy":                 "XLE",
+        "Consumer Discretionary": "XLY",
+        "Consumer Staples":       "XLP",
+        "Industrials":            "XLI",
+        "Materials":              "XLB",
+        "Real Estate":            "XLRE",
+        "Utilities":              "XLU",
+        "Communications":         "XLC",
+    }
+
+    def __init__(self, analyzer: Optional[SentimentEngagementAnalyzer] = None):
+        self.analyzer  = analyzer
+        self._tech_eng = TechnicalFeatureEngineer()
+
+    def _fetch_ohlcv(self, symbol: str, period: str = "6mo") -> pd.DataFrame:
+        """Fetch OHLCV from yfinance and normalise column names."""
+        try:
+            import yfinance as yf
+        except ImportError as e:
+            raise ImportError("yfinance required: pip install yfinance") from e
+
+        hist = yf.Ticker(symbol).history(period=period)[["Open", "High", "Low", "Close", "Volume"]]
+        hist.columns = [c.lower() for c in hist.columns]
+        hist.index   = pd.to_datetime(hist.index).normalize()
+        if hist.empty:
+            raise ValueError(f"No data returned for ticker '{symbol}'")
+        return hist
+
+    def _fetch_info(self, symbol: str) -> Dict:
+        """Fetch yfinance info dict safely."""
+        try:
+            import yfinance as yf
+            return yf.Ticker(symbol).info or {}
+        except Exception:
+            return {}
+
+    def predict_from_ticker(
+        self,
+        symbol: str,
+        period: str = "6mo",
+        model_variant: FeatureSet = FeatureSet.BASELINE,
+    ) -> pd.DataFrame:
+        """
+        Fetch recent OHLCV, compute technical features, and return model
+        predictions with intervals (conformal if available).
+
+        By default, this uses the BASELINE model variant, since realtime tweet
+        features are not included here.
+        """
+        if self.analyzer is None or not self.analyzer._is_fitted:
+            raise RuntimeError("Provide a fitted SentimentEngagementAnalyzer to the engine.")
+
+        hist = self._fetch_ohlcv(symbol, period)
+        df   = self._tech_eng.build(hist)
+        df.index = df.index.date
+
+        if model_variant == FeatureSet.FULL:
+            # No live sentiment in this utility -> zero-fill sentiment columns
+            for col in SentimentEngagementAnalyzer.SENTIMENT_FEATURES:
+                if col not in df.columns:
+                    df[col] = 0.0
+
+        return self.analyzer.predict(df, return_intervals=True, variant=model_variant)
+
+    def technical_snapshot(self, symbol: str) -> Dict:
+        """Compute a concise technical indicator snapshot (no model needed)."""
+        hist = self._fetch_ohlcv(symbol, period="6mo")
+        df   = self._tech_eng.build(hist)
+        row  = df.iloc[-1]
+        prev = df.iloc[-2] if len(df) > 1 else row
+
+        rsi       = float(row.get("rsi_14", 50))
+        rsi_label = "Oversold" if rsi < 30 else "Overbought" if rsi > 70 else "Neutral"
+
+        macd_c  = float(row.get("macd", 0))
+        macd_s  = float(row.get("macd_signal", 0))
+        macd_p  = float(prev.get("macd", 0))
+        macd_sp = float(prev.get("macd_signal", 0))
+        macd_signal = (
+            "BUY"  if (macd_c > macd_s and macd_p <= macd_sp) else
+            "SELL" if (macd_c < macd_s and macd_p >= macd_sp) else
+            "HOLD"
+        )
+
+        bp = float(row.get("bollinger_pct", 0.5))
+        bb_pos = "UPPER" if bp > 0.8 else "LOWER" if bp < 0.2 else "MIDDLE"
+
+        vr = float(row.get("volume_ratio", 1.0))
+        vol_trend = "INCREASING" if vr > 1.2 else "DECREASING" if vr < 0.8 else "NORMAL"
+
+        return {
+            "symbol":            symbol,
+            "date":              str(df.index[-1]),
+            "close":             float(row.get("close", 0)),
+            "daily_return":      float(row.get("daily_return", 0)),
+            "rsi_14":            rsi,
+            "rsi_label":         rsi_label,
+            "macd":              float(row.get("macd", 0)),
+            "macd_signal":       macd_signal,
+            "macd_histogram":    float(row.get("macd_histogram", 0)),
+            "bollinger_pct":     bp,
+            "bollinger_pos":     bb_pos,
+            "bollinger_width":   float(row.get("bollinger_width", 0)),
+            "volume_ratio":      vr,
+            "volume_trend":      vol_trend,
+            "volatility_14d":    float(row.get("volatility_14d", 0)),
+            "atr_14":            float(row.get("atr_14", 0)),
+            "sma_7":             float(row.get("sma_7", 0)),
+            "sma_14":            float(row.get("sma_14", 0)),
+            "price_momentum_5d": float(row.get("price_momentum_5d", 0)),
+            "obv":               float(row.get("obv", 0)),
+        }
+
+    def fundamental_snapshot(self, symbol: str) -> Dict:
+        """Fetch fundamental data from yfinance and produce a simple score + targets."""
+        info = self._fetch_info(symbol)
+
+        def _f(key: str, scale: float = 1.0) -> float:
+            v = info.get(key)
+            return float(v) * scale if v is not None else 0.0
+
+        current_price   = _f("currentPrice") or _f("regularMarketPrice")
+        pe_ratio        = _f("trailingPE")
+        forward_pe      = _f("forwardPE")
+        peg_ratio       = _f("pegRatio")
+        roe             = _f("returnOnEquity", 100)
+        roa             = _f("returnOnAssets", 100)
+        debt_equity     = _f("debtToEquity") / 100
+        gross_margin    = _f("grossMargins", 100)
+        rev_growth      = _f("revenueGrowth", 100)
+        earnings_growth = _f("earningsGrowth", 100)
+        dividend_yield  = _f("dividendYield", 100)
+        analyst_target  = _f("targetMeanPrice") or current_price
+
+        rec_raw = (info.get("recommendationKey") or "hold").lower()
+        rec_map = {
+            "strong_buy": "STRONG_BUY", "buy": "BUY",
+            "hold": "HOLD", "sell": "SELL", "strong_sell": "STRONG_SELL",
+        }
+        analyst_consensus = rec_map.get(rec_raw, "HOLD")
+
+        score, factors, risks = 0, [], []
+
+        if 0 < pe_ratio < 15:
+            score += 1; factors.append(f"Lower trailing P/E ({pe_ratio:.1f})")
+        elif pe_ratio > 35:
+            score -= 1; risks.append(f"Higher trailing P/E ({pe_ratio:.1f})")
+
+        if roe > 15:
+            score += 1; factors.append(f"ROE {roe:.1f}%")
+        elif 0 < roe < 5:
+            score -= 1; risks.append(f"Lower ROE {roe:.1f}%")
+        elif roe < 0:
+            score -= 2; risks.append(f"Negative ROE {roe:.1f}%")
+
+        if debt_equity > 1.5:
+            score -= 1; risks.append(f"Higher debt/equity {debt_equity:.2f}")
+        elif 0 <= debt_equity < 0.5:
+            score += 1; factors.append(f"Lower debt/equity {debt_equity:.2f}")
+
+        if rev_growth > 10:
+            score += 1; factors.append(f"Revenue growth {rev_growth:.1f}%")
+        elif rev_growth < 0:
+            score -= 1; risks.append(f"Declining revenue {rev_growth:.1f}%")
+
+        if gross_margin > 50:
+            score += 1; factors.append(f"Gross margin {gross_margin:.1f}%")
+
+        analyst_scores = {"STRONG_BUY": 2, "BUY": 1, "HOLD": 0, "SELL": -1, "STRONG_SELL": -2}
+        score += analyst_scores.get(analyst_consensus, 0)
+        if analyst_consensus != "HOLD":
+            factors.append(f"Analyst consensus: {analyst_consensus}")
+
+        if   score >= 4:  recommendation, confidence = "STRONG_BUY",  0.87
+        elif score >= 2:  recommendation, confidence = "BUY",         0.74
+        elif score <= -4: recommendation, confidence = "STRONG_SELL", 0.87
+        elif score <= -2: recommendation, confidence = "SELL",        0.74
+        else:             recommendation, confidence = "HOLD",        0.60
+
+        upside = (analyst_target / current_price) if current_price > 0 else 1.0
+        price_targets = {
+            "conservative": round(current_price * max(1.0, upside * 0.90), 2),
+            "base_case":    round(analyst_target, 2),
+            "optimistic":   round(current_price * max(1.05, upside * 1.10), 2),
+            "pessimistic":  round(current_price * min(0.95, upside * 0.80), 2),
+        }
+
+        return {
+            "symbol":            symbol,
+            "company_name":      info.get("longName", symbol),
+            "current_price":     round(current_price, 2),
+            "market_cap":        info.get("marketCap"),
+            "pe_ratio":          round(pe_ratio, 1),
+            "forward_pe":        round(forward_pe, 1),
+            "peg_ratio":         round(peg_ratio, 2),
+            "roe":               round(roe, 1),
+            "roa":               round(roa, 1),
+            "debt_equity":       round(debt_equity, 2),
+            "gross_margin":      round(gross_margin, 1),
+            "revenue_growth":    round(rev_growth, 1),
+            "earnings_growth":   round(earnings_growth, 1),
+            "dividend_yield":    round(dividend_yield, 2),
+            "analyst_consensus": analyst_consensus,
+            "analyst_target":    round(analyst_target, 2),
+            "score":             score,
+            "recommendation":    recommendation,
+            "confidence":        confidence,
+            "key_factors":       factors[:5],
+            "risks":             risks[:5],
+            "price_targets":     price_targets,
+        }
+
+    def full_stock_analysis(self, symbol: str) -> Dict:
+        """Combined technical + fundamental analysis; baseline prediction by default."""
+        analysis = {
+            "technical":   self.technical_snapshot(symbol),
+            "fundamental": self.fundamental_snapshot(symbol),
+        }
+        if self.analyzer is not None and self.analyzer._is_fitted:
+            try:
+                preds  = self.predict_from_ticker(symbol, model_variant=FeatureSet.BASELINE)
+                latest = float(preds["prediction"].iloc[-1])
+                analysis["model_prediction"] = {
+                    "variant":          "BASELINE",
+                    "predicted_return": round(latest, 5),
+                    "direction":        "UP" if latest > 0 else "DOWN",
+                    "lower_95":         round(float(preds["lower"].iloc[-1]), 5) if "lower" in preds.columns else None,
+                    "upper_95":         round(float(preds["upper"].iloc[-1]), 5) if "upper" in preds.columns else None,
+                    "interval_method":  preds.get("interval_method", pd.Series([""])).iloc[-1] if "interval_method" in preds.columns else "",
+                    "note":             "Baseline (technical-only) model used for realtime utility.",
+                }
+            except Exception as e:
+                analysis["model_prediction"] = {"error": str(e)}
+        return analysis
+
+    def sector_rotation_analysis(self) -> pd.DataFrame:
+        """Rank sector ETFs vs SPY over 6 months (simple relative performance)."""
+        try:
+            import yfinance as yf
+        except ImportError as e:
+            raise ImportError("yfinance required: pip install yfinance") from e
+
+        spy_hist   = yf.Ticker("SPY").history(period="6mo")["Close"]
+        spy_return = float((spy_hist.iloc[-1] / spy_hist.iloc[0] - 1) * 100)
+
+        rows = []
+        for sector, etf in self.SECTOR_ETFS.items():
+            try:
+                snap = self.technical_snapshot(etf)
+                hist = self._fetch_ohlcv(etf, period="6mo")
+                abs_ret = float((hist["close"].iloc[-1] / hist["close"].iloc[0] - 1) * 100)
+                rel_ret = abs_ret - spy_return
+                momentum = float(
+                    (hist["close"].iloc[-1] / hist["close"].iloc[-10] - 1) * 100
+                    if len(hist) >= 10 else 0.0
+                )
+                rows.append({
+                    "sector":          sector,
+                    "etf":             etf,
+                    "abs_return_6m_%": round(abs_ret, 2),
+                    "rel_to_spy_%":    round(rel_ret, 2),
+                    "momentum_2w_%":   round(momentum, 2),
+                    "rsi":             round(snap["rsi_14"], 1),
+                    "macd_signal":     snap["macd_signal"],
+                    "volume_trend":    snap["volume_trend"],
+                    "volatility_14d":  round(snap["volatility_14d"], 4),
+                    "bollinger_pos":   snap.get("bollinger_pos", "MIDDLE"),
+                })
+            except Exception as e:
+                logger.warning(f"Could not analyse {sector} ({etf}): {e}")
+
+        df = pd.DataFrame(rows)
+        return df.sort_values("rel_to_spy_%", ascending=False).reset_index(drop=True)
+
+    def print_analysis(self, analysis: Dict) -> None:
+        """Formatted console display for a full_stock_analysis result."""
+        tech  = analysis.get("technical", {})
+        fund  = analysis.get("fundamental", {})
+        model = analysis.get("model_prediction", {})
+        W = 62
+
+        print("\n" + "=" * W)
+        print(f"  ANALYSIS: {fund.get('symbol','')} — {fund.get('company_name','')}")
+        print("=" * W)
+        print(f"  Current Price      : ${fund.get('current_price', 'N/A')}")
+        print(f"  Daily Return       : {tech.get('daily_return', 0):+.2%}")
+        print(f"\n  RECOMMENDATION     : {fund.get('recommendation','')}  "
+              f"(Confidence: {fund.get('confidence', 0):.0%})")
+
+        print("\n  TECHNICAL INDICATORS")
+        print("  " + "─" * (W - 2))
+        print(f"    RSI (14-day)       : {tech.get('rsi_14', 0):.1f} ({tech.get('rsi_label', '')})")
+        print(f"    MACD Signal        : {tech.get('macd_signal', '')} (hist={tech.get('macd_histogram', 0):.4f})")
+        print(f"    Bollinger Band     : {tech.get('bollinger_pos', '')} "
+              f"(pct={tech.get('bollinger_pct', 0):.2f}, width={tech.get('bollinger_width', 0):.3f})")
+        print(f"    Volume Trend       : {tech.get('volume_trend', '')} (ratio={tech.get('volume_ratio', 0):.2f})")
+        print(f"    Volatility (14d)   : {tech.get('volatility_14d', 0):.4f}")
+        print(f"    ATR (14d)          : {tech.get('atr_14', 0):.2f}")
+        print(f"    SMA 7 / 14         : {tech.get('sma_7', 0):.2f} / {tech.get('sma_14', 0):.2f}")
+        print(f"    Momentum (5d)      : {tech.get('price_momentum_5d', 0):+.2%}")
+
+        print("\n  FUNDAMENTAL DATA")
+        print("  " + "─" * (W - 2))
+        print(f"    P/E (trailing)     : {fund.get('pe_ratio', 0):.1f}")
+        print(f"    P/E (forward)      : {fund.get('forward_pe', 0):.1f}")
+        print(f"    PEG Ratio          : {fund.get('peg_ratio', 0):.2f}")
+        print(f"    ROE                : {fund.get('roe', 0):.1f}%")
+        print(f"    ROA                : {fund.get('roa', 0):.1f}%")
+        print(f"    Debt/Equity        : {fund.get('debt_equity', 0):.2f}")
+        print(f"    Gross Margin       : {fund.get('gross_margin', 0):.1f}%")
+        print(f"    Revenue Growth     : {fund.get('revenue_growth', 0):.1f}%")
+        print(f"    Earnings Growth    : {fund.get('earnings_growth', 0):.1f}%")
+        print(f"    Dividend Yield     : {fund.get('dividend_yield', 0):.2f}%")
+        print(f"    Analyst Target     : ${fund.get('analyst_target', 0):.2f}")
+        print(f"    Analyst Consensus  : {fund.get('analyst_consensus', '')}")
+
+        if fund.get("key_factors"):
+            print("\n  KEY FACTORS")
+            for f_ in fund["key_factors"]:
+                print(f"    + {f_}")
+
+        if fund.get("risks"):
+            print("\n  RISKS")
+            for r in fund["risks"]:
+                print(f"    − {r}")
+
+        pt = fund.get("price_targets", {})
+        if pt:
+            print("\n  PRICE TARGETS")
+            for k, v in pt.items():
+                print(f"    {k:<20}: ${v:.2f}")
+
+        if model and "error" not in model:
+            print("\n  MODEL PREDICTION")
+            print("  " + "─" * (W - 2))
+            print(f"    Variant            : {model.get('variant', '')}")
+            print(f"    Predicted Return   : {model.get('predicted_return', 0):+.5f}")
+            print(f"    Direction          : {model.get('direction', '')}")
+            if model.get("lower_95") is not None and model.get("upper_95") is not None:
+                print(f"    Interval           : [{model.get('lower_95', 0):+.5f},  {model.get('upper_95', 0):+.5f}]")
+                if model.get("interval_method"):
+                    print(f"    Interval method    : {model.get('interval_method')}")
+            if "note" in model:
+                print(f"    Note: {model['note']}")
+
+        print("=" * W)
+
+
+# ============================================================================
+# Data loading utilities
+# ============================================================================
+
+def load_tweet_data(
+    kaggle_path: str = "dadalyndell/elon-musk-tweets-2010-to-2025-march",
+    file_path: str = "all_musk_posts.csv",
+) -> pd.DataFrame:
+    """Load the Elon Musk tweet dataset from Kaggle via kagglehub."""
+    try:
+        import kagglehub
+        from kagglehub import KaggleDatasetAdapter
+        df = kagglehub.load_dataset(KaggleDatasetAdapter.PANDAS, kaggle_path, file_path)
+        logger.info(f"Loaded {len(df):,} tweets from Kaggle.")
+        return df
+    except ImportError as e:
+        raise ImportError("kagglehub required: pip install kagglehub[pandas-datasets]") from e
+
+
+def load_ohlcv_data(
+    symbol: str = "TSLA",
+    start: str = "2010-01-01",
+    end: str = "2025-10-31",
+    api_key: str = "",
+    dataset: str = "EQUS.MINI",
+) -> pd.DataFrame:
+    """Load OHLCV data from DataBento."""
+    try:
+        import databento as db
+        client = db.Historical(api_key)
+        ohlcv  = client.timeseries.get_range(
+            dataset=dataset, schema="ohlcv-1d",
+            symbols=symbol, start=start, end=end,
+        )
+        df = ohlcv.to_df()
+        df.index   = pd.to_datetime(df.index).date
+        df.columns = [c.lower() for c in df.columns]
+        logger.info(f"Loaded {len(df):,} OHLCV rows from DataBento.")
+        return df
+    except ImportError as e:
+        raise ImportError("databento required: pip install databento") from e
+
+
+# ============================================================================
+# Entry point
+# ============================================================================
+
+if __name__ == "__main__":
+    print(__doc__)
+    print("=" * 68)
+    print("FULL USAGE EXAMPLE")
+    print("=" * 68)
+    print("""
+# ── Step 1: Load data ─────────────────────────────────────────────────────
+tweet_df = load_tweet_data()
+stock_df = load_ohlcv_data(api_key="YOUR_DATABENTO_KEY")
+
+# ── Step 2: Run FinBERT preprocessing (if sentiment not pre-computed) ─────
+preprocessor = TweetPreprocessor(min_confidence=0.60, batch_size=64)
+tweet_df = preprocessor.load_and_process(tweet_df, run_inference=True)
+
+# ── Step 3: Configure and fit the analyzer ────────────────────────────────
+config = ModelConfig(
+    model_type        = ModelType.RIDGE,
+    feature_set       = FeatureSet.FULL,
+    feature_selection = FeatureSelectionStrategy.LOW_COLLINEARITY,
+    vif_threshold     = 10.0,
+    test_size         = 0.20,
+    cv_folds          = 5,
+    bootstrap_n       = 1000,
+    rolling_windows   = [3, 7, 14],
+    verbose           = True,
+)
+analyzer = SentimentEngagementAnalyzer(config)
+analyzer.fit(stock_df, tweet_df)
+
+# ── Step 4: Review results ────────────────────────────────────────────────
+analyzer.summary()
+analyzer.plot("all")                      # all panels
+print(analyzer.get_feature_importance())  # top features by |β|
+print(analyzer.get_metrics())             # metrics
+print(analyzer.check_assumptions())       # diagnostics
+analyzer.export_results("./results")      # save to CSV
+
+# ── Step 5: Predict on new data ───────────────────────────────────────────
+new_obs = {col: 0.0 for col in analyzer.BASELINE_FEATURES}
+preds   = analyzer.predict(new_obs, return_intervals=True, variant=FeatureSet.FULL)
+
+# ── Step 6: Realtime utility (baseline by default) ────────────────────────
+engine   = RealTimeInferenceEngine(analyzer)
+analysis = engine.full_stock_analysis("TSLA")
+engine.print_analysis(analysis)
+
+sectors  = engine.sector_rotation_analysis()
+print(sectors.to_string(index=False))
+""")
